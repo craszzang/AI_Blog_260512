@@ -9,15 +9,18 @@ import telebot
 from flask import Flask
 
 # ==============================================================================
-# [설정 1] API 키 및 봇 상태 관리
+# [설정 1] API 키 및 봇 상태 관리 (Larksuite 가이드 완벽 적용)
 # ==============================================================================
 CLAUDE_API_KEY = "sk-a0930e3ebdb7c2358c23a52f9eb01ea7dac076cb721c5b2dbe4da843eb11d018"
-CLAUDE_BASE_URL = "https://aiprimetech.io"
-PEXELS_API_KEY = "z9EFVT2LMQQgLRQzpRqtVRi86ySFL2GPeqZHSSMwZkCtqi3RRYNGGGkc"
+
+# ❗매우 중요: 링크/사진에 적힌 "Base URL" (보통 api.aiprimetech.io/v1 형태)을 정확히 넣어주세요.
+CLAUDE_BASE_URL = "https://api.aiprimetech.io" 
 
 # ❗텔레그램 토큰을 반드시 다시 넣어주세요❗
-TELEGRAM_TOKEN = "6471858413:AAHmM-DbecDZjKv1OLz07KiEcADz3syBd2c"
+TELEGRAM_TOKEN = "여기에_텔레그램_토큰을_넣어주세요"
+PEXELS_API_KEY = "z9EFVT2LMQQgLRQzpRqtVRi86ySFL2GPeqZHSSMwZkCtqi3RRYNGGGkc"
 
+# 우회 서버(가이드) 표준에 맞춘 클라이언트 설정
 client_claude = anthropic.Anthropic(
     api_key=CLAUDE_API_KEY, 
     base_url=CLAUDE_BASE_URL,
@@ -28,7 +31,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 is_running = False  # 봇 비상정지 스위치
 
 # ==============================================================================
-# [설정 2] 워드프레스 작업 리스트 (56개 완벽 복구)
+# [설정 2] 워드프레스 작업 리스트 (56개 완벽 유지)
 # ==============================================================================
 tasks = [
     # --- 1번 사이트 (아마존 뷰티) ---
@@ -103,7 +106,7 @@ tasks = [
 ]
 
 # ==============================================================================
-# [공통] 헬퍼 함수 (메시지 및 스마트 슬립)
+# [공통] 헬퍼 함수
 # ==============================================================================
 def send_msg(chat_id, text):
     try:
@@ -113,31 +116,27 @@ def send_msg(chat_id, text):
         print(f"텔레그램 통신 에러: {e}")
 
 def smart_sleep(seconds):
-    """지정된 시간(초)만큼 대기하되, 1초마다 is_running을 검사하여 강제 종료 시 즉시 탈출합니다."""
     global is_running
     for _ in range(seconds):
         if not is_running: break
         time.sleep(1)
-
-# ==============================================================================
-# [핵심] Claude API 자동 스위칭 함수 (4중 Fallback)
+        # ==============================================================================
+# [핵심] Claude API 자동 스위칭 함수 (Larksuite 우회 서버 완벽 호환)
 # ==============================================================================
 def call_claude_api(prompt, max_tokens, chat_id, step_name):
-    """에러 발생 시 모델을 바꿔가며 돌파하는 무적의 함수"""
     global is_running
     
-    # 순서대로 찔러볼 공식/비공식 모델 리스트 (하이쿠 우선 -> 소넷 백업)
+    # 우회 서버(aiprimetech) 가이드에서 지원하는 최신 공식 모델명
     CLAUDE_MODELS = [
-        "claude-3-haiku-20240307",      # 공식 하이쿠 (가장 빠름, 대기 없음)
-        "claude-3-5-sonnet-20241022",   # 최신 소넷
-        "claude-3-5-haiku-20241022",    # 최신 하이쿠
-        "claude-sonnet-4-7"             # 기존 가명 백업
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-haiku-20240307"
     ]
     
-    send_msg(chat_id, f"💡 [{step_name}] AI 연결을 시도합니다...")
+    send_msg(chat_id, f"💡 [{step_name}] 우회 서버 연결을 시도합니다...")
     
     for model_name in CLAUDE_MODELS:
-        for attempt in range(2): # 각 모델당 2번씩 끈질기게 시도
+        for attempt in range(2): 
             if not is_running: return None
             try:
                 msg = client_claude.messages.create(
@@ -148,14 +147,14 @@ def call_claude_api(prompt, max_tokens, chat_id, step_name):
                 return msg.content[0].text
             except Exception as e:
                 if not is_running: return None
-                send_msg(chat_id, f"⚠️ [{model_name}] 혼잡/오류. 10초 대기 후 돌파 시도...")
+                send_msg(chat_id, f"⚠️ [{model_name}] 오류 발생. 10초 대기 후 재시도... ({e})")
                 smart_sleep(10)
                 
-    send_msg(chat_id, f"❌ 모든 AI 모델이 응답하지 않습니다. 이번 작업은 건너뜁니다.")
+    send_msg(chat_id, f"❌ 모든 모델이 응답하지 않습니다. 이번 작업은 건너뜁니다.")
     return None
 
 # ==============================================================================
-# [기능 함수 모음]
+# [기능 함수 모음] 워드프레스 & 이미지
 # ==============================================================================
 def get_free_image(keyword, chat_id):
     if not is_running: return None
@@ -243,7 +242,8 @@ def process_tasks_in_background(chat_id, tasks_to_run):
         
         try:
             if json_text.startswith("```json"): json_text = json_text[7:-3].strip()
-            elif json_text.startswith("```"): json_text = json_text[3:-3].strip()
+            elif json_text.startswith("
+```"): json_text = json_text[3:-3].strip()
             result_data = json.loads(json_text)
         except:
             send_msg(chat_id, "❌ JSON 파싱 실패. 이 작업을 건너뜁니다.")
@@ -266,7 +266,7 @@ def process_tasks_in_background(chat_id, tasks_to_run):
 # ==============================================================================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🤖 **초고속 수익화 봇 가동!**\n- 시작: `1-1` 또는 `A` 입력\n- 강제종료: `/stop` 입력", parse_mode="Markdown")
+    bot.reply_to(message, "🤖 **클로드 API 복구 완료!**\n- 시작: `1-1` 또는 `A` 입력\n- 강제종료: `/stop` 입력", parse_mode="Markdown")
 
 @bot.message_handler(commands=['stop'])
 def stop_bot(message):
@@ -304,7 +304,7 @@ def handle_run_command(message):
 # ==============================================================================
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Telegram Bot is Running smoothly!"
+def home(): return "Telegram Bot is Running smoothly with Claude!"
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
