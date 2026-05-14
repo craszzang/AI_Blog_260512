@@ -1,46 +1,31 @@
-import os
-import sys
+\import os
 import json
 import requests
 import time
 import base64
-import re
+import threading
 import anthropic
 import telebot
-import threading
-from flask import Flask # 클라우드를 속이기 위한 가짜 웹서버 부품
+from flask import Flask
 
 # ==============================================================================
-# [설정 1] API 키 세팅
+# [설정 1] API 키 및 봇 상태 관리
 # ==============================================================================
 CLAUDE_API_KEY = "sk-a0930e3ebdb7c2358c23a52f9eb01ea7dac076cb721c5b2dbe4da843eb11d018"
 CLAUDE_BASE_URL = "https://aiprimetech.io"
 PEXELS_API_KEY = "z9EFVT2LMQQgLRQzpRqtVRi86ySFL2GPeqZHSSMwZkCtqi3RRYNGGGkc"
-TELEGRAM_TOKEN = "6471858413:AAHmM-DbecDZjKv1OLz07KiEcADz3syBd2c" # ❗반드시 다시 넣어주세요❗
+
+# ❗텔레그램 토큰을 반드시 다시 넣어주세요❗
+TELEGRAM_TOKEN = "6471858413:AAHmM-DbecDZjKv1OLz07KiEcADz3syBd2c"
 
 client_claude = anthropic.Anthropic(
     api_key=CLAUDE_API_KEY, 
     base_url=CLAUDE_BASE_URL,
-    default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"}
+    default_headers={"User-Agent": "Mozilla/5.0"}
 ) 
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-# ❗비상 정지를 위한 전역 스위치(플래그) 추가❗
-STOP_FLAG = False
-
-# ==============================================================================
-# [클라우드 생존용 가짜 웹서버 세팅] Render.com 등에서 포트(Port) 바인딩용
-# ==============================================================================
-app = Flask(__name__)
-
-@app.route('/')
-def keep_alive():
-    return "Bot is running 24/7!"
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+is_running = False  # 봇 비상정지 스위치
 
 # ==============================================================================
 # [설정 2] 워드프레스 작업 리스트 (56개 완벽 복구)
@@ -118,187 +103,213 @@ tasks = [
 ]
 
 # ==============================================================================
-# [공통] 텔레그램 메시지 전송 헬퍼 함수
+# [공통] 헬퍼 함수 (메시지 및 스마트 슬립)
 # ==============================================================================
 def send_msg(chat_id, text):
     try:
         bot.send_message(chat_id, text)
-        print(text) # 터미널 출력
+        print(text)
     except Exception as e:
-        print(f"텔레그램 전송 에러: {e}")
+        print(f"텔레그램 통신 에러: {e}")
+
+def smart_sleep(seconds):
+    """지정된 시간(초)만큼 대기하되, 1초마다 is_running을 검사하여 강제 종료 시 즉시 탈출합니다."""
+    global is_running
+    for _ in range(seconds):
+        if not is_running: break
+        time.sleep(1)
 
 # ==============================================================================
-# [함수 1~5] 코어 자동화 로직 (Haiku 모델로 변경, 과부하 무한존버 탑재)
+# [핵심] Claude API 자동 스위칭 함수 (4중 Fallback)
+# ==============================================================================
+def call_claude_api(prompt, max_tokens, chat_id, step_name):
+    """에러 발생 시 모델을 바꿔가며 돌파하는 무적의 함수"""
+    global is_running
+    
+    # 순서대로 찔러볼 공식/비공식 모델 리스트 (하이쿠 우선 -> 소넷 백업)
+    CLAUDE_MODELS = [
+        "claude-3-haiku-20240307",      # 공식 하이쿠 (가장 빠름, 대기 없음)
+        "claude-3-5-sonnet-20241022",   # 최신 소넷
+        "claude-3-5-haiku-20241022",    # 최신 하이쿠
+        "claude-sonnet-4-7"             # 기존 가명 백업
+    ]
+    
+    send_msg(chat_id, f"💡 [{step_name}] AI 연결을 시도합니다...")
+    
+    for model_name in CLAUDE_MODELS:
+        for attempt in range(2): # 각 모델당 2번씩 끈질기게 시도
+            if not is_running: return None
+            try:
+                msg = client_claude.messages.create(
+                    model=model_name,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return msg.content[0].text
+            except Exception as e:
+                if not is_running: return None
+                send_msg(chat_id, f"⚠️ [{model_name}] 혼잡/오류. 10초 대기 후 돌파 시도...")
+                smart_sleep(10)
+                
+    send_msg(chat_id, f"❌ 모든 AI 모델이 응답하지 않습니다. 이번 작업은 건너뜁니다.")
+    return None
+
+# ==============================================================================
+# [기능 함수 모음]
 # ==============================================================================
 def get_free_image(keyword, chat_id):
+    if not is_running: return None
     send_msg(chat_id, f"📸 Pexels 이미지 검색 중: '{keyword}'...")
     try:
         url = f"https://api.pexels.com/v1/search?query={keyword}&per_page=1&orientation=landscape"
-        res = requests.get(url, headers={"Authorization": PEXELS_API_KEY})
-        if res.status_code == 200 and res.json()['photos']:
+        headers = {"Authorization": PEXELS_API_KEY}
+        res = requests.get(url, headers=headers)
+        if res.status_code == 200 and res.json().get('photos'):
             return requests.get(res.json()['photos'][0]['src']['large']).content
     except: pass
     return None
 
-def get_outline_claude(keyword, chat_id):
-    global STOP_FLAG
-    send_msg(chat_id, "🧠 [Agent 1] 완벽한 SEO 목차 기획 중...")
-    prompt = f'You are an elite SEO Strategist. Create a detailed outline about "{keyword}". Include: 1. 5 key facts 2. H2/H3 structure 3. 10 LSI keywords. Output ONLY structured text.'
-    
-    attempt = 0
-    while True:
-        if STOP_FLAG: return None # 정지 신호가 오면 즉시 탈출
-        try:
-            # ❗과부하 방지: 가장 가볍고 빠른 하이쿠 모델 사용❗
-            msg = client_claude.messages.create(model="claude-haiku-4-5", max_tokens=1500, messages=[{"role": "user", "content": prompt}])
-            return msg.content[0].text
-        except Exception as e:
-            attempt += 1
-            wait_time = min(15 * (2 ** (attempt - 1)), 1800)
-            send_msg(chat_id, f"⚠️ 서버 과부하 (시도 {attempt}회차) - {wait_time//60}분 {wait_time%60}초 후 자동 재시도...")
-            
-            # 대기 시간 중에도 1초마다 정지 버튼이 눌렸는지 감시
-            for _ in range(wait_time):
-                if STOP_FLAG: return None
-                time.sleep(1)
+def get_or_create_term(base_url, headers, endpoint, name):
+    if not is_running: return None
+    slug = name.strip().lower().replace(" ", "-")
+    try:
+        res = requests.get(f"{base_url}/{endpoint}?search={name}", headers=headers)
+        if res.status_code == 200 and res.json():
+            for item in res.json():
+                if item['name'].lower() == name.lower(): return item['id']
+        res_create = requests.post(f"{base_url}/{endpoint}", headers=headers, json={"name": name, "slug": slug})
+        if res_create.status_code in [200, 201]: return res_create.json()['id']
+    except: pass
+    return None
 
-def generate_full_content_claude(keyword, target_website, outline_data, chat_id):
-    global STOP_FLAG
-    MODEL_NAME = "claude-haiku-4-5" # ❗쾌속 차선 하이쿠❗
-    writer_prompt = f"Write an engaging blog post strictly on this outline. Tone: Witty, US English. Over 1500 words. Keyword: {keyword}\nOutline: {outline_data}"
-    
-    send_msg(chat_id, "✍️ [Agent 2] 원고 작성 중...")
-    draft = None
-    attempt = 0
-    while True:
-        if STOP_FLAG: return None # 정지 신호 확인
-        try:
-            msg1 = client_claude.messages.create(model=MODEL_NAME, max_tokens=3500, messages=[{"role": "user", "content": writer_prompt}])
-            draft = msg1.content[0].text
-            break
-        except Exception as e:
-            attempt += 1
-            wait_time = min(15 * (2 ** (attempt - 1)), 1800)
-            send_msg(chat_id, f"⚠️ 원고 작성 지연 (시도 {attempt}회차) - {wait_time}초 후 재시도...")
-            for _ in range(wait_time):
-                if STOP_FLAG: return None
-                time.sleep(1)
-
-    if not draft: return None
-
-    editor_prompt = f"""Format this draft into a strict JSON object. RULES: Headline starts with "{keyword}". First sentence contains "{keyword}". Use HTML tags (<h2>, <p>). Add link to {target_website}.
-    Output ONLY raw JSON: {{"headline": "...", "seo_description": "...", "tags": ["tag1"], "blog_body_html": "<p>...</p>"}} \nDraft: {draft}"""
-
-    send_msg(chat_id, "🧐 [Agent 3] SEO 포맷팅 중...")
-    attempt = 0
-    while True:
-        if STOP_FLAG: return None # 정지 신호 확인
-        try:
-            msg2 = client_claude.messages.create(model=MODEL_NAME, max_tokens=4000, messages=[{"role": "user", "content": editor_prompt}])
-            json_text = msg2.content[0].text.strip()
-            if json_text.startswith("```json"): json_text = json_text[7:-3].strip()
-            elif json_text.startswith("```"): json_text = json_text[3:-3].strip()
-            return json.loads(json_text)
-        except Exception as e:
-            attempt += 1
-            wait_time = min(15 * (2 ** (attempt - 1)), 1800)
-            send_msg(chat_id, f"⚠️ 포맷팅 지연 (시도 {attempt}회차) - {wait_time}초 후 재시도...")
-            for _ in range(wait_time):
-                if STOP_FLAG: return None
-                time.sleep(1)
-
-def upload_to_wordpress(task, data, thumb_data, chat_id):
-    send_msg(chat_id, f"📤 워드프레스 업로드 중 -> [{task['site_name']}]...")
-    token = base64.b64encode(f"{task['wp_user']}:{task['wp_pass']}".encode()).decode('utf-8')
+def upload_to_wordpress(task_info, data, thumb_data, chat_id):
+    if not is_running: return
+    send_msg(chat_id, f"📤 워드프레스 업로드 중 -> [{task_info['site_name']}]...")
+    token = base64.b64encode(f"{task_info['wp_user']}:{task_info['wp_pass']}".encode()).decode('utf-8')
     headers = {'Authorization': f'Basic {token}'}
-    base_url = task['wp_url']
+    base_url = task_info['wp_url']
 
-    # 카테고리/태그 가져오기 생략 (코드 간소화)
+    cat_id = get_or_create_term(base_url, headers, 'categories', task_info['keyword'])
+    tag_ids = [tid for t in data.get('tags', []) if (tid := get_or_create_term(base_url, headers, 'tags', t))]
+
     thumb_id = None
     if thumb_data:
         try:
-            res = requests.post(f"{base_url}/media", headers=headers, files={'file': (f"{task['keyword']}.jpg", thumb_data, 'image/jpeg')})
+            res = requests.post(f"{base_url}/media", headers=headers, files={'file': (f"{task_info['keyword']}.jpg", thumb_data, 'image/jpeg')})
             if res.status_code in [200, 201]: thumb_id = res.json().get('id')
         except: pass
 
     try:
-        post_slug = task['keyword'].strip().lower().replace(" ", "-")
-        post_data = {'title': data.get('headline', f"{task['keyword']} Guide"), 'content': data.get('blog_body_html', ''), 'status': 'publish', 'slug': post_slug}
+        post_data = {
+            'title': data.get('headline', f"{task_info['keyword']} Guide"),
+            'content': data.get('blog_body_html', ''),
+            'status': 'publish', 'categories': [cat_id] if cat_id else [], 'tags': tag_ids,
+            'slug': task_info['keyword'].strip().lower().replace(" ", "-")
+        }
         if thumb_id: post_data['featured_media'] = thumb_id
         
         res_post = requests.post(f"{base_url}/posts", headers=headers, json=post_data)
-        if res_post.status_code in [200, 201]: send_msg(chat_id, f"✅ 포스팅 성공!\n{res_post.json().get('link')}")
-        else: send_msg(chat_id, f"❌ 업로드 실패")
-    except: send_msg(chat_id, f"❌ 통신 에러")
+        if res_post.status_code in [200, 201]: send_msg(chat_id, f"✅ 포스팅 성공! 링크:\n{res_post.json().get('link')}")
+        else: send_msg(chat_id, f"❌ 업로드 실패: {res_post.text}")
+    except Exception as e: send_msg(chat_id, f"❌ 통신 에러: {e}")
 
 # ==============================================================================
-# [텔레그램 봇 리스너 & 비상정지 제어]
+# [메인 실행 스레드 (봇의 두뇌)]
+# ==============================================================================
+def process_tasks_in_background(chat_id, tasks_to_run):
+    global is_running
+    
+    for task in tasks_to_run:
+        if not is_running: break
+        send_msg(chat_id, f"\n▶️ [작업 {task['display_id']}] {task['site_name']} ({task['keyword']}) 시작...")
+        
+        # 1. 목차 기획
+        prompt1 = f"""You are an elite SEO Strategist. Create a highly detailed, professional blog post outline about "{task['keyword']}".
+        Include: 1. 5 key factual points to rank on Google. 2. A structured outline (H2/H3). 3. 10 LSI keywords. Output ONLY the structured text."""
+        outline = call_claude_api(prompt1, 1500, chat_id, "Agent 1 - 목차 기획")
+        if not outline or not is_running: continue
+        
+        # 2. 본문 작성
+        prompt2 = f"You are a Viral Content Director. Write an engaging blog post based strictly on this outline. Tone: Witty, Native US English. Over 1500 words. Focus Keyword: {task['keyword']}\nOutline: {outline}"
+        draft = call_claude_api(prompt2, 3500, chat_id, "Agent 2 - 본문 작성")
+        if not draft or not is_running: continue
+
+        # 3. JSON 포맷팅
+        prompt3 = f"""Format this draft into a strict JSON object. RULES: Headline starts with "{task['keyword']}". First sentence contains "{task['keyword']}". Use HTML tags (<h2>, <p>). Add link to {task['target_website']}. Output ONLY raw JSON:
+        {{"headline": "{task['keyword']}: ...", "seo_description": "...", "tags": ["tag1", "tag2"], "blog_body_html": "<p>...</p>"}}
+        Draft: {draft}"""
+        json_text = call_claude_api(prompt3, 4000, chat_id, "Agent 3 - 포맷 검수")
+        if not json_text or not is_running: continue
+        
+        try:
+            if json_text.startswith("```json"): json_text = json_text[7:-3].strip()
+            elif json_text.startswith("```"): json_text = json_text[3:-3].strip()
+            result_data = json.loads(json_text)
+        except:
+            send_msg(chat_id, "❌ JSON 파싱 실패. 이 작업을 건너뜁니다.")
+            continue
+
+        if not is_running: break
+        thumb_data = get_free_image(task['keyword'], chat_id)
+        upload_to_wordpress(task, result_data, thumb_data, chat_id)
+        
+        if not is_running: break
+        send_msg(chat_id, "과부하 방지 10초 휴식...")
+        smart_sleep(10)
+        
+    if is_running:
+        send_msg(chat_id, "🎉 지시하신 모든 포스팅이 완료되었습니다! 다음 명령을 기다립니다.")
+    is_running = False
+
+# ==============================================================================
+# [텔레그램 명령어 수신부]
 # ==============================================================================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    global STOP_FLAG
-    STOP_FLAG = False # 봇 깨울 때 정지 모드 해제
-    bot.reply_to(message, "🤖 **자동화 비서 대기 중!**\n\n- 실행: `1-1` 또는 `A` 전송\n- 비상정지: `/stop` 전송", parse_mode="Markdown")
+    bot.reply_to(message, "🤖 **초고속 수익화 봇 가동!**\n- 시작: `1-1` 또는 `A` 입력\n- 강제종료: `/stop` 입력", parse_mode="Markdown")
 
-# ❗비상 정지 명령어 (플래그 변경으로 즉시 브레이크 작동)❗
 @bot.message_handler(commands=['stop'])
 def stop_bot(message):
-    global STOP_FLAG
-    STOP_FLAG = True
-    send_msg(message.chat.id, "🛑 [비상 정지 수신] 진행 중인 모든 작업을 즉시 취소하고 대기합니다!")
-
-# 백그라운드에서 돌아가는 실제 작업 함수 (스레드 분리)
-def process_tasks(chat_id, tasks_to_run):
-    global STOP_FLAG
-    send_msg(chat_id, f"🚀 {len(tasks_to_run)}개 작업 릴레이 시작!")
-    
-    for task in tasks_to_run:
-        if STOP_FLAG:
-            send_msg(chat_id, "🛑 작업이 사용자에 의해 강제 종료되었습니다.")
-            break
-            
-        send_msg(chat_id, f"\n▶️ [작업 {task['display_id']}] {task['keyword']}")
-        
-        outline = get_outline_claude(task['keyword'], chat_id)
-        if not outline or STOP_FLAG: continue
-        
-        result = generate_full_content_claude(task['keyword'], task['target_website'], outline, chat_id)
-        if not result or STOP_FLAG: continue
-        
-        thumb_data = get_free_image(task['keyword'], chat_id)
-        if STOP_FLAG: continue
-        
-        upload_to_wordpress(task, result, thumb_data, chat_id)
-        
-        # 대기 중에도 정지가 가능하도록 1초씩 쪼개서 휴식
-        for _ in range(5):
-            if STOP_FLAG: break
-            time.sleep(1)
-        
-    if not STOP_FLAG:
-        send_msg(chat_id, "🎉 지시하신 모든 포스팅 완료!")
+    global is_running
+    if is_running:
+        is_running = False
+        bot.reply_to(message, "🛑 강제 정지 신호를 보냈습니다! 진행 중이던 통신이 끝나는 즉시 봇이 멈춥니다.")
+    else:
+        bot.reply_to(message, "현재 실행 중인 작업이 없습니다.")
 
 @bot.message_handler(func=lambda message: True)
 def handle_run_command(message):
-    global STOP_FLAG
+    global is_running
     chat_id = message.chat.id
     user_input = message.text.strip().upper()
     
+    if is_running:
+        send_msg(chat_id, "⚠️ 이미 다른 작업이 실행 중입니다. 멈추시려면 `/stop`을 입력하세요.")
+        return
+
     for i, task in enumerate(tasks): task['display_id'] = f"{(i // 8) + 1}-{(i % 8) + 1}"
     group_map = {'A': 0, 'B': 1, 'C': 2, 'D': 3, 'E': 4, 'F': 5, 'G': 6, 'H': 7}
-    
     tasks_to_run = [t for t in tasks if (user_input in group_map and int(t['display_id'].split('-')[1]) == group_map[user_input] + 1) or t['display_id'] == user_input]
 
-    if not tasks_to_run: return send_msg(chat_id, "❌ 알 수 없는 명령입니다.")
+    if not tasks_to_run:
+        send_msg(chat_id, "❌ 매칭되는 작업 번호가 없습니다. (예: 1-1 또는 A)")
+        return
     
-    STOP_FLAG = False # 새 작업 시작 시 브레이크 풀기
-    
-    # ❗투트랙 엔진 가동: 메신저 창이 멈추지 않도록 백그라운드로 작업 던지기❗
-    threading.Thread(target=process_tasks, args=(chat_id, tasks_to_run), daemon=True).start()
+    is_running = True
+    send_msg(chat_id, f"🚀 총 {len(tasks_to_run)}개의 작업을 백그라운드에서 시작합니다! (정지: /stop)")
+    threading.Thread(target=process_tasks_in_background, args=(chat_id, tasks_to_run)).start()
+
+# ==============================================================================
+# [Render 클라우드 가짜 웹서버 (위장막)]
+# ==============================================================================
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Telegram Bot is Running smoothly!"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 if __name__ == "__main__":
+    threading.Thread(target=run_flask).start() # 가짜 웹서버 가동
     print("클라우드용 텔레그램 봇 가동 시작...")
-    # Flask 가짜 웹서버를 백그라운드 스레드로 실행
-    threading.Thread(target=run_web, daemon=True).start()
-    # 텔레그램 봇 리스너 시작
-    bot.polling(none_stop=True, timeout=90)
+    bot.polling(none_stop=True) # 텔레그램 귀 열어두기
